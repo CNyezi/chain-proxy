@@ -1,0 +1,15 @@
+services:
+  chain-proxy:
+    build:
+      context: .
+    image: holtye/chain-proxy:latest
+    container_name: chain-proxy
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:${HOST_MIXED_PORT:-17899}:${MIXED_PORT:-17898}"
+      - "127.0.0.1:${HOST_CONTROLLER_PORT:-19091}:9090"
