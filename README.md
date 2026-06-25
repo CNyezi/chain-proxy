@@ -91,6 +91,7 @@ Optional:
 | `WATCH_TIMEOUT_MS` | `6000` | Per-candidate latency timeout. |
 | `WATCH_CONCURRENCY` | `16` | Number of chain candidates tested concurrently. |
 | `SWITCH_MARGIN_MS` | `150` | Required improvement before switching chains. |
+| `SWITCH_STABLE_ROUNDS` | `2` | Required consecutive faster rounds before switching healthy chains. |
 | `MIHOMO_LOG_LEVEL` | `info` | mihomo log level. |
 | `SUB_FETCH_PROXY` | empty | Optional proxy used only to fetch the subscription. |
 

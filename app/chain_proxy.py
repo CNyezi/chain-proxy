@@ -37,6 +37,7 @@ WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL_SEC", "60"))
 TIMEOUT_MS = int(os.getenv("WATCH_TIMEOUT_MS", "6000"))
 WATCH_CONCURRENCY = int(os.getenv("WATCH_CONCURRENCY", "16"))
 SWITCH_MARGIN_MS = int(os.getenv("SWITCH_MARGIN_MS", "150"))
+SWITCH_STABLE_ROUNDS = max(1, int(os.getenv("SWITCH_STABLE_ROUNDS", "2")))
 MIHOMO_LOG_LEVEL = os.getenv("MIHOMO_LOG_LEVEL", "info")
 SUB_FETCH_PROXY = os.getenv("SUB_FETCH_PROXY", "")
 
@@ -258,6 +259,7 @@ def select_chain(name: str) -> None:
 def watchdog_loop() -> None:
     current: str | None = None
     current_score: int | None = None
+    faster_rounds = 0
     wait_for_controller()
     log("watchdog started")
     while not stop_event.is_set():
@@ -285,20 +287,22 @@ def watchdog_loop() -> None:
             scores.sort(key=lambda item: item[0])
             best_score, best_name = scores[0]
             healthy = {name for _, name in scores}
-            should_switch = (
-                current is None
-                or current_score is None
-                or current not in healthy
-                or best_score + SWITCH_MARGIN_MS < current_score
+            current_score = next((score for score, name in scores if name == current), current_score)
+            must_switch = current is None or current_score is None or current not in healthy
+            faster_rounds = (
+                faster_rounds + 1
+                if not must_switch and best_score + SWITCH_MARGIN_MS < current_score
+                else 0
             )
+            should_switch = must_switch or faster_rounds >= SWITCH_STABLE_ROUNDS
 
             if should_switch:
                 select_chain(best_name)
                 current, current_score = best_name, best_score
+                faster_rounds = 0
                 log(f"selected chain_delay_ms={best_score} name={best_name!r}")
             else:
                 select_chain(current)
-                current_score = next((score for score, name in scores if name == current), current_score)
                 log(f"kept chain_delay_ms={current_score} best_ms={best_score} name={current!r}")
         except Exception as exc:
             log(f"watchdog loop error: {exc}")
