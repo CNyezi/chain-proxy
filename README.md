@@ -28,8 +28,24 @@ SOCKS5 successfully.
 - Expands every subscription proxy into a complete chain proxy.
 - Keeps the final exit fixed to your configured SOCKS5 proxy.
 - Concurrently measures real end-to-end chain latency.
-- Automatically switches to a lower-latency healthy chain.
+- Automatically switches to a lower-latency healthy chain with EWMA smoothing.
+- Limits watchdog probe pressure while still rotating through untested nodes.
+- Emits mihomo DNS, TCP concurrent, keep-alive, and unified-delay settings.
 - Keeps secrets out of the image; everything sensitive is runtime env.
+
+## Optimization Notes
+
+The application side is treated as uncontrollable. This container optimizes the
+parts it can own:
+
+- DNS is explicit and configurable. `DNS_NAMESERVERS` handles normal resolution,
+  while `DNS_PROXY_SERVER_NAMESERVERS` is used for proxy server hostnames.
+- `tcp-concurrent`, `keep-alive-idle`, and `unified-delay` are enabled by
+  default in generated mihomo config.
+- The watchdog no longer has to probe every candidate each round. It keeps the
+  current chain, known low-latency chains, and a small rotating exploration set.
+- Chain scores use EWMA plus failure penalty/cooldown, so one fast or slow probe
+  is less likely to cause a bad switch.
 
 ## Quick Start
 
@@ -59,8 +75,8 @@ Test the proxy:
 
 ```bash
 curl -x http://127.0.0.1:17898 -L -o /dev/null -sS \
-  -w 'code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
-  https://claude.ai/
+  -w 'code=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
+  https://api.anthropic.com/
 
 curl -x http://127.0.0.1:17898 https://api.ipify.org
 ```
@@ -86,12 +102,24 @@ Optional:
 | --- | ---: | --- |
 | `MIXED_PORT` | `17898` | HTTP/SOCKS mixed proxy port inside the container. |
 | `SUB_UPDATE_INTERVAL` | `3600` | Subscription refresh interval in seconds. |
-| `CHAIN_TEST_URL` | `https://claude.ai/` | URL used for full-chain latency tests. |
+| `CHAIN_TEST_URL` | `https://api.anthropic.com/` | URL used for full-chain latency tests. |
 | `WATCH_INTERVAL_SEC` | `60` | Watchdog interval in seconds. |
-| `WATCH_TIMEOUT_MS` | `6000` | Per-candidate latency timeout. |
-| `WATCH_CONCURRENCY` | `16` | Number of chain candidates tested concurrently. |
+| `WATCH_TIMEOUT_MS` | `5000` | Per-candidate latency timeout. |
+| `WATCH_CONCURRENCY` | `8` | Number of chain candidates tested concurrently. |
+| `WATCH_PRECHECK_LIMIT` | `12` | Maximum candidates probed in one watchdog round. Set `0` to probe all. |
+| `WATCH_EXPLORATION_SLOTS` | `2` | Slots reserved for rotating untested candidates each limited round. |
 | `SWITCH_MARGIN_MS` | `150` | Required improvement before switching chains. |
 | `SWITCH_STABLE_ROUNDS` | `2` | Required consecutive faster rounds before switching healthy chains. |
+| `EWMA_ALPHA` | `0.35` | Weight of the newest latency sample in chain scoring. |
+| `FAIL_PENALTY_MS` | `1000` | Score penalty added per recent failure. |
+| `FAIL_COOLDOWN_ROUNDS` | `3` | Watchdog rounds to skip a failed chain before retrying. |
+| `EXCLUDE_PROXY_KEYWORDS` | empty | Comma-separated proxy-name keywords excluded before chain expansion. |
+| `DNS_NAMESERVERS` | `223.5.5.5,119.29.29.29,1.1.1.1` | Comma-separated DNS servers emitted into mihomo `dns.nameserver`. |
+| `DNS_PROXY_SERVER_NAMESERVERS` | same as `DNS_NAMESERVERS` | DNS servers emitted into mihomo `dns.proxy-server-nameserver`. |
+| `ENABLE_TCP_CONCURRENT` | `true` | Emits mihomo `tcp-concurrent`. |
+| `ENABLE_KEEP_ALIVE` | `true` | Emits mihomo `keep-alive-idle`. |
+| `KEEP_ALIVE_IDLE_SEC` | `30` | Idle seconds for mihomo keep-alive. |
+| `UNIFIED_DELAY` | `true` | Emits mihomo `unified-delay`. |
 | `MIHOMO_LOG_LEVEL` | `info` | mihomo log level. |
 | `SUB_FETCH_PROXY` | empty | Optional proxy used only to fetch the subscription. |
 

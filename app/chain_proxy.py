@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import hashlib
 import json
 import os
@@ -32,14 +33,31 @@ MIXED_PORT = int(os.getenv("MIXED_PORT", "17898"))
 CONTROLLER_PORT = 9090
 CONTROLLER_SECRET = os.getenv("CONTROLLER_SECRET", "")
 SUB_UPDATE_INTERVAL = int(os.getenv("SUB_UPDATE_INTERVAL", "3600"))
-TEST_URL = os.getenv("CHAIN_TEST_URL", "https://claude.ai/")
+TEST_URL = os.getenv("CHAIN_TEST_URL", "https://api.anthropic.com/")
 WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL_SEC", "60"))
-TIMEOUT_MS = int(os.getenv("WATCH_TIMEOUT_MS", "6000"))
-WATCH_CONCURRENCY = int(os.getenv("WATCH_CONCURRENCY", "16"))
+TIMEOUT_MS = int(os.getenv("WATCH_TIMEOUT_MS", "5000"))
+WATCH_CONCURRENCY = int(os.getenv("WATCH_CONCURRENCY", "8"))
+WATCH_PRECHECK_LIMIT = int(os.getenv("WATCH_PRECHECK_LIMIT", "12"))
+WATCH_EXPLORATION_SLOTS = int(os.getenv("WATCH_EXPLORATION_SLOTS", "2"))
 SWITCH_MARGIN_MS = int(os.getenv("SWITCH_MARGIN_MS", "150"))
 SWITCH_STABLE_ROUNDS = max(1, int(os.getenv("SWITCH_STABLE_ROUNDS", "2")))
+EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.35"))
+FAIL_PENALTY_MS = int(os.getenv("FAIL_PENALTY_MS", "1000"))
+FAIL_COOLDOWN_ROUNDS = int(os.getenv("FAIL_COOLDOWN_ROUNDS", "3"))
 MIHOMO_LOG_LEVEL = os.getenv("MIHOMO_LOG_LEVEL", "info")
 SUB_FETCH_PROXY = os.getenv("SUB_FETCH_PROXY", "")
+EXCLUDE_PROXY_KEYWORDS = tuple(
+    item.strip() for item in os.getenv("EXCLUDE_PROXY_KEYWORDS", "").split(",") if item.strip()
+)
+DNS_NAMESERVERS = os.getenv("DNS_NAMESERVERS", "223.5.5.5,119.29.29.29,1.1.1.1")
+DNS_PROXY_SERVER_NAMESERVERS = os.getenv(
+    "DNS_PROXY_SERVER_NAMESERVERS",
+    DNS_NAMESERVERS,
+)
+ENABLE_TCP_CONCURRENT = os.getenv("ENABLE_TCP_CONCURRENT", "true").lower() in {"1", "true", "yes", "on"}
+ENABLE_KEEP_ALIVE = os.getenv("ENABLE_KEEP_ALIVE", "true").lower() in {"1", "true", "yes", "on"}
+KEEP_ALIVE_IDLE_SEC = int(os.getenv("KEEP_ALIVE_IDLE_SEC", "30"))
+UNIFIED_DELAY = os.getenv("UNIFIED_DELAY", "true").lower() in {"1", "true", "yes", "on"}
 
 CONTROLLER_URL = f"http://127.0.0.1:{CONTROLLER_PORT}"
 CHAIN_GROUP = "CHAIN"
@@ -53,6 +71,10 @@ mihomo_proc: subprocess.Popen[bytes] | None = None
 
 def log(message: str) -> None:
     print(f"[chain-proxy] {message}", flush=True)
+
+
+def env_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def require_env() -> None:
@@ -109,9 +131,13 @@ def build_config(subscription: bytes) -> tuple[dict[str, Any], int]:
     loaded = yaml.safe_load(subscription.decode("utf-8", errors="replace"))
     if not isinstance(loaded, dict):
         raise ValueError("subscription is not a Clash YAML object")
-    first_hops = unique_proxy_names(loaded.get("proxies", []))
+    first_hops = [
+        proxy
+        for proxy in unique_proxy_names(loaded.get("proxies", []))
+        if not any(keyword in proxy["name"] for keyword in EXCLUDE_PROXY_KEYWORDS)
+    ]
     if not first_hops:
-        raise ValueError("subscription contains no usable proxies")
+        raise ValueError("subscription contains no usable proxies after filters")
 
     all_proxies = list(first_hops)
     chain_proxies: list[str] = []
@@ -131,24 +157,33 @@ def build_config(subscription: bytes) -> tuple[dict[str, Any], int]:
             }
         )
 
+    dns_config = {
+        "enable": True,
+        "listen": "0.0.0.0:1053",
+        "enhanced-mode": "fake-ip",
+        "nameserver": env_list(DNS_NAMESERVERS),
+    }
+    proxy_server_nameservers = env_list(DNS_PROXY_SERVER_NAMESERVERS)
+    if proxy_server_nameservers:
+        dns_config["proxy-server-nameserver"] = proxy_server_nameservers
+
     config = {
         "mixed-port": MIXED_PORT,
         "bind-address": "*",
         "allow-lan": True,
         "mode": "rule",
         "log-level": MIHOMO_LOG_LEVEL,
+        "tcp-concurrent": ENABLE_TCP_CONCURRENT,
+        "unified-delay": UNIFIED_DELAY,
         "external-controller": f"0.0.0.0:{CONTROLLER_PORT}",
         "secret": CONTROLLER_SECRET,
-        "dns": {
-            "enable": True,
-            "listen": "0.0.0.0:1053",
-            "enhanced-mode": "fake-ip",
-            "nameserver": ["1.1.1.1", "8.8.8.8"],
-        },
+        "dns": dns_config,
         "proxies": all_proxies,
         "proxy-groups": [{"name": CHAIN_GROUP, "type": "select", "proxies": chain_proxies}],
         "rules": [f"MATCH,{CHAIN_GROUP}"],
     }
+    if ENABLE_KEEP_ALIVE:
+        config["keep-alive-idle"] = KEEP_ALIVE_IDLE_SEC
     return config, len(chain_proxies)
 
 
@@ -252,14 +287,132 @@ def delay_candidate(name: str) -> tuple[str, int | None]:
         return name, None
 
 
+@dataclasses.dataclass
+class ChainStats:
+    ewma_ms: float | None = None
+    failures: int = 0
+    cooldown_rounds: int = 0
+
+
+@dataclasses.dataclass
+class ChainDecision:
+    selected: str
+    score_ms: int | None
+    best: str
+    best_score_ms: int | None
+    switched: bool
+
+
+class ChainSelector:
+    def __init__(self) -> None:
+        self.stats: dict[str, ChainStats] = {}
+        self.current: str | None = None
+        self.faster_rounds = 0
+        self.explore_cursor = 0
+
+    def pick_candidates(self, candidates: list[str]) -> list[str]:
+        if WATCH_PRECHECK_LIMIT <= 0 or len(candidates) <= WATCH_PRECHECK_LIMIT:
+            return candidates
+
+        active = [name for name in candidates if self.stats.get(name, ChainStats()).cooldown_rounds <= 0]
+        if not active:
+            active = candidates
+
+        def rank(name: str) -> tuple[float, str]:
+            stats = self.stats.get(name)
+            if not stats or stats.ewma_ms is None:
+                return float("inf"), name
+            return stats.ewma_ms + stats.failures * FAIL_PENALTY_MS, name
+
+        known = [name for name in active if self.stats.get(name, ChainStats()).ewma_ms is not None]
+        unknown = [name for name in active if self.stats.get(name, ChainStats()).ewma_ms is None]
+        picked: list[str] = []
+        if self.current in active:
+            picked.append(self.current)
+
+        exploration_slots = max(0, min(WATCH_EXPLORATION_SLOTS, WATCH_PRECHECK_LIMIT - len(picked)))
+        if unknown and exploration_slots:
+            start = self.explore_cursor % len(unknown)
+            rotated = unknown[start:] + unknown[:start]
+            picked.extend(name for name in rotated[:exploration_slots] if name not in picked)
+            self.explore_cursor = (start + exploration_slots) % len(unknown)
+
+        picked.extend(name for name in sorted(known, key=rank) if name not in picked)
+        picked.extend(name for name in unknown if name not in picked)
+        return picked[:WATCH_PRECHECK_LIMIT]
+
+    def record_round(self, scores: dict[str, int | None]) -> ChainDecision:
+        for stats in self.stats.values():
+            if stats.cooldown_rounds > 0:
+                stats.cooldown_rounds -= 1
+
+        for name, score in scores.items():
+            stats = self.stats.setdefault(name, ChainStats())
+            if score is None:
+                stats.failures += 1
+                stats.cooldown_rounds = max(stats.cooldown_rounds, FAIL_COOLDOWN_ROUNDS)
+                continue
+            stats.failures = 0
+            stats.cooldown_rounds = 0
+            stats.ewma_ms = (
+                float(score)
+                if stats.ewma_ms is None
+                else EWMA_ALPHA * float(score) + (1.0 - EWMA_ALPHA) * stats.ewma_ms
+            )
+
+        ranked = [
+            (self._effective_score(name), name)
+            for name, stats in self.stats.items()
+            if stats.ewma_ms is not None and stats.cooldown_rounds <= 0
+        ]
+        if not ranked:
+            ranked = [
+                (self._effective_score(name), name)
+                for name, stats in self.stats.items()
+                if stats.ewma_ms is not None
+            ]
+        if not ranked:
+            raise ValueError("no healthy chain candidates")
+
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        best_score, best_name = ranked[0]
+        current_score = self._effective_score(self.current) if self.current else None
+        must_switch = self.current is None or current_score is None
+        if not must_switch and best_name != self.current and best_score + SWITCH_MARGIN_MS < current_score:
+            self.faster_rounds += 1
+        else:
+            self.faster_rounds = 0
+
+        should_switch = must_switch or self.faster_rounds >= SWITCH_STABLE_ROUNDS
+        if should_switch:
+            self.current = best_name
+            self.faster_rounds = 0
+
+        selected = self.current or best_name
+        selected_score = self._effective_score(selected)
+        return ChainDecision(
+            selected=selected,
+            score_ms=round(selected_score) if selected_score is not None else None,
+            best=best_name,
+            best_score_ms=round(best_score),
+            switched=should_switch,
+        )
+
+    def _effective_score(self, name: str | None) -> float | None:
+        if name is None:
+            return None
+        stats = self.stats.get(name)
+        if not stats or stats.ewma_ms is None:
+            return None
+        return stats.ewma_ms + stats.failures * FAIL_PENALTY_MS
+
+
 def select_chain(name: str) -> None:
     controller_request("PUT", f"/proxies/{quote_name(CHAIN_GROUP)}", {"name": name})
 
 
 def watchdog_loop() -> None:
-    current: str | None = None
-    current_score: int | None = None
-    faster_rounds = 0
+    selector = ChainSelector()
     wait_for_controller()
     log("watchdog started")
     while not stop_event.is_set():
@@ -270,40 +423,35 @@ def watchdog_loop() -> None:
                 stop_event.wait(WATCH_INTERVAL)
                 continue
 
+            candidates = selector.pick_candidates(candidates)
             workers = max(1, min(WATCH_CONCURRENCY, len(candidates)))
-            scores: list[tuple[int, str]] = []
+            scores: dict[str, int | None] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [pool.submit(delay_candidate, name) for name in candidates]
                 for future in concurrent.futures.as_completed(futures):
                     name, score = future.result()
-                    if score is not None:
-                        scores.append((score, name))
+                    scores[name] = score
 
             if not scores:
                 log("watchdog found no healthy chain candidates")
                 stop_event.wait(WATCH_INTERVAL)
                 continue
 
-            scores.sort(key=lambda item: item[0])
-            best_score, best_name = scores[0]
-            healthy = {name for _, name in scores}
-            current_score = next((score for score, name in scores if name == current), current_score)
-            must_switch = current is None or current_score is None or current not in healthy
-            faster_rounds = (
-                faster_rounds + 1
-                if not must_switch and best_score + SWITCH_MARGIN_MS < current_score
-                else 0
-            )
-            should_switch = must_switch or faster_rounds >= SWITCH_STABLE_ROUNDS
-
-            if should_switch:
-                select_chain(best_name)
-                current, current_score = best_name, best_score
-                faster_rounds = 0
-                log(f"selected chain_delay_ms={best_score} name={best_name!r}")
+            decision = selector.record_round(scores)
+            if decision.switched:
+                select_chain(decision.selected)
+                log(
+                    "selected "
+                    f"chain_score_ms={decision.score_ms} best_ms={decision.best_score_ms} "
+                    f"name={decision.selected!r}"
+                )
             else:
-                select_chain(current)
-                log(f"kept chain_delay_ms={current_score} best_ms={best_score} name={current!r}")
+                select_chain(decision.selected)
+                log(
+                    "kept "
+                    f"chain_score_ms={decision.score_ms} best_ms={decision.best_score_ms} "
+                    f"name={decision.selected!r}"
+                )
         except Exception as exc:
             log(f"watchdog loop error: {exc}")
             wait_for_controller()
